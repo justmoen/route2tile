@@ -36,10 +36,10 @@ WINE_IMC_PATH = os.path.expanduser(
 )
 
 TARGET_ZOOM = 16  # Ideal detail-to-size balance for Vulcan 7R (800x480)
-ATLAS_ZOOM_LEVELS = (16, 17, 18)
+ATLAS_ZOOM_LEVELS = (14, 15, 16, 17, 18)
 AT5_OUTPUT_DIR = os.path.expanduser("~/Downloads")
 OPEN_WATER_BUFFER_NM = 0.5  # Narrow corridor in deep open water
-COASTAL_BUFFER_NM = 2.5  # Wider corridor when near land or reefs
+COASTAL_BUFFER_NM = 1.5  # Wider corridor when near land or reefs
 
 TILE_SOURCES = {
     "Esri_World_Imagery": (
@@ -785,9 +785,7 @@ def automate_imc_in_wine(imc_exe_path, mac_input_dir, atlas_name):
         delay 0.4
         keystroke tab
         delay 0.4
-        keystroke "4"
-        delay 0.4
-        keystroke "4"
+        keystroke "3"
         delay 0.4
 
         -- Select Downloads as the work directory.
