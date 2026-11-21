@@ -1,0 +1,8 @@
+gpxpy
+mercantile
+numpy
+opencv-python
+pyproj
+rasterio
+requests
+shapely

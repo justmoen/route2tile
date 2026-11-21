@@ -1,4 +1,6 @@
 imc_input_geotiffs/
 .venv/
 __pycache__/
+tile_cache/
+winner_tile_cache/
 .DS_Store

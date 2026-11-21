@@ -1,7 +1,11 @@
 import argparse
+from collections import deque
+import hashlib
+import json
 import math
 import os
 import re
+import shutil
 import struct
 import subprocess
 import time
@@ -23,12 +27,17 @@ from shapely.ops import transform, unary_union
 # ==============================================================================
 DEFAULT_INPUT_FILE_PATH = "WaypointsRoutesTracks.usr"
 OUTPUT_DIR = os.path.abspath("./imc_input_geotiffs")
+SHARED_IMC_DIR = os.path.expanduser("~/route2tile_shared/imc_input_geotiffs")
+TILE_CACHE_DIR = os.path.abspath("./tile_cache")
+WINNER_CACHE_DIR = os.path.abspath("./winner_tile_cache")
 DEFAULT_ATLAS_NAME = "Vulcan7R_Passage"
 WINE_IMC_PATH = os.path.expanduser(
-    "~/.wine/drive_c/Program Files (x86)/Navico/Insight Map Creator/InsightMapCreator.exe"
+    "~/Applications/Wineskin/Insight Map Creator.app"
 )
 
 TARGET_ZOOM = 16  # Ideal detail-to-size balance for Vulcan 7R (800x480)
+ATLAS_ZOOM_LEVELS = (16, 17, 18)
+AT5_OUTPUT_DIR = os.path.expanduser("~/Downloads")
 OPEN_WATER_BUFFER_NM = 0.5  # Narrow corridor in deep open water
 COASTAL_BUFFER_NM = 2.5  # Wider corridor when near land or reefs
 
@@ -59,14 +68,27 @@ def quadkey(x, y, z):
     return qk
 
 
-def fetch_tile_image(source_template, x, y, z):
+def fetch_tile_image(source_template, x, y, z, source_name=None):
     url = source_template.format(x=x, y=y, z=z, q=quadkey(x, y, z))
+    cache_key = source_name or hashlib.sha256(source_template.encode("utf-8")).hexdigest()[:12]
+    cache_key = re.sub(r"[^A-Za-z0-9_-]+", "_", cache_key).strip("_")
+    cache_path = os.path.join(TILE_CACHE_DIR, cache_key, str(z), str(x), f"{y}.jpg")
+
+    if os.path.isfile(cache_path):
+        cached = cv2.imread(cache_path, cv2.IMREAD_COLOR)
+        if cached is not None:
+            return cached
+
     try:
         resp = requests.get(url, headers=HEADERS, timeout=6)
         if resp.status_code != 200 or len(resp.content) < 3500:
             return None
         arr = np.frombuffer(resp.content, np.uint8)
-        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is not None:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            cv2.imwrite(cache_path, img)
+        return img
     except Exception:
         return None
 
@@ -331,7 +353,7 @@ def select_route_interactively(choices):
     if len(choices) == 1:
         label, line, pts = choices[0]
         print(f"Only 1 route found: {label} ({len(pts)} points)")
-        return [line], pts, label
+        return [line], pts, label, [(label, line, pts)]
 
     print("\nAvailable routes/tracks in file:")
     for i, (label, _, pts) in enumerate(choices, start=1):
@@ -343,13 +365,14 @@ def select_route_interactively(choices):
         if raw.isdigit():
             selection = int(raw)
             if selection == 0:
-                all_lines = [c[1] for c in choices]
                 all_pts = [pt for c in choices for pt in c[2]]
-                return all_lines, all_pts, "All_Routes"
+                return [c[1] for c in choices], all_pts, "All_Routes", choices
             elif 1 <= selection <= len(choices):
                 chosen_label, chosen_line, chosen_pts = choices[selection - 1]
                 print(f"Selected: {chosen_label}")
-                return [chosen_line], chosen_pts, chosen_label
+                return [chosen_line], chosen_pts, chosen_label, [
+                    (chosen_label, chosen_line, chosen_pts)
+                ]
         print("Invalid choice. Please enter a valid number from the list.")
 
 
@@ -360,7 +383,9 @@ def build_adaptive_corridor(file_path):
     else:
         choices = parse_gpx_choices(file_path)
 
-    lines, selected_coords, chosen_name = select_route_interactively(choices)
+    lines, selected_coords, chosen_name, route_choices = select_route_interactively(choices)
+    if chosen_name == "All_Routes":
+        return None, selected_coords, chosen_name, route_choices
 
     to_meters = Transformer.from_crs(
         "EPSG:4326", "EPSG:3857", always_xy=True
@@ -392,48 +417,42 @@ def build_adaptive_corridor(file_path):
                 probe_tile.x,
                 probe_tile.y,
                 10,
+                "Esri_World_Imagery",
             )
 
             near_coast = has_land_or_obstacle(probe_img)
             radius_nm = COASTAL_BUFFER_NM if near_coast else OPEN_WATER_BUFFER_NM
             buffered_segments.append(sub_line_m.buffer(radius_nm * 1852.0))
 
-    safe_atlas_name = re.sub(r"[^A-Za-z0-9_-]+", "_", chosen_name).strip("_")
-    if not safe_atlas_name:
-        safe_atlas_name = DEFAULT_ATLAS_NAME
-
-    return transform(to_wgs84, unary_union(buffered_segments)), selected_coords, safe_atlas_name
+    return (
+        transform(to_wgs84, unary_union(buffered_segments)),
+        selected_coords,
+        chosen_name,
+        route_choices,
+    )
 
 
 # ==============================================================================
 # 2. AUTOMATIC SOURCE SELECTION
 # ==============================================================================
-def select_best_source(sample_coords, zoom):
-    print("Evaluating satellite sources for clarity and cloud cover...")
-    sample_indices = np.linspace(
-        0, len(sample_coords) - 1, num=min(6, len(sample_coords)), dtype=int
-    )
-    scores = {name: [] for name in TILE_SOURCES}
+def select_best_source_for_tile(tile):
+    """Compare every configured source for one tile and return its best image and name."""
+    scored_sources = []
 
-    for idx in sample_indices:
-        lon, lat = sample_coords[idx]
-        t = mercantile.tile(lon, lat, zoom)
-        for name, url_tmpl in TILE_SOURCES.items():
-            img = fetch_tile_image(url_tmpl, t.x, t.y, zoom)
-            s = score_source_quality(img)
-            if s > 0:
-                scores[name].append(s)
+    for source_name, source_url in TILE_SOURCES.items():
+        img = fetch_tile_image(source_url, tile.x, tile.y, tile.z, source_name)
+        if img is None or not has_land_or_obstacle(img):
+            continue
 
-    best_source = None
-    best_avg = -1.0
-    for name, s_list in scores.items():
-        avg_score = np.mean(s_list) if s_list else -1.0
-        print(f"  - {name}: quality score = {avg_score:.1f}")
-        if avg_score > best_avg:
-            best_avg = avg_score
-            best_source = name
+        quality_score = score_source_quality(img)
+        if quality_score > 0:
+            scored_sources.append((quality_score, source_name, img))
 
-    return best_source if (best_source and best_avg > 0) else "Esri_World_Imagery"
+    if not scored_sources:
+        return None, None, None
+
+    quality_score, source_name, img = max(scored_sources, key=lambda item: item[0])
+    return source_name, img, quality_score
 
 
 # ==============================================================================
@@ -481,6 +500,94 @@ def save_geotiff_for_imc(img_bgr, tile, out_dir):
     write_tfw_file(filename, bounds.west, bounds.north, px_width, px_height)
 
 
+def winner_cache_dir(source_name):
+    safe_source = re.sub(r"[^A-Za-z0-9_-]+", "_", source_name).strip("_")
+    return os.path.join(WINNER_CACHE_DIR, safe_source)
+
+
+def winner_cache_paths(source_name, tile):
+    cache_dir = winner_cache_dir(source_name)
+    base_name = f"tile_{tile.z}_{tile.x}_{tile.y}"
+    return (
+        os.path.join(cache_dir, base_name + ".tif"),
+        os.path.join(cache_dir, base_name + ".tfw"),
+    )
+
+
+def restore_cached_winner(source_name, tile, out_dir):
+    cached_tif, cached_tfw = winner_cache_paths(source_name, tile)
+    if not (os.path.isfile(cached_tif) and os.path.isfile(cached_tfw)):
+        return False
+
+    base_name = f"tile_{tile.z}_{tile.x}_{tile.y}"
+    shutil.copy2(cached_tif, os.path.join(out_dir, base_name + ".tif"))
+    shutil.copy2(cached_tfw, os.path.join(out_dir, base_name + ".tfw"))
+    return True
+
+
+def restore_cached_tile(tile, out_dir):
+    base_name = f"tile_{tile.z}_{tile.x}_{tile.y}"
+    manifest_path = os.path.join(WINNER_CACHE_DIR, base_name + ".json")
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+                manifest = json.load(manifest_file)
+                source_name = manifest.get("source")
+        except (OSError, json.JSONDecodeError):
+            source_name = None
+
+        if manifest.get("status") == "skipped":
+            return "__skipped__"
+
+        if source_name in TILE_SOURCES and restore_cached_winner(source_name, tile, out_dir):
+            return source_name
+
+    for source_name in TILE_SOURCES:
+        if restore_cached_winner(source_name, tile, out_dir):
+            cache_winner_manifest(source_name, tile)
+            return source_name
+    return None
+
+
+def cache_winner(source_name, tile):
+    base_name = f"tile_{tile.z}_{tile.x}_{tile.y}"
+    source_tif = os.path.join(OUTPUT_DIR, base_name + ".tif")
+    source_tfw = os.path.join(OUTPUT_DIR, base_name + ".tfw")
+    cached_tif, cached_tfw = winner_cache_paths(source_name, tile)
+
+    os.makedirs(os.path.dirname(cached_tif), exist_ok=True)
+    shutil.copy2(source_tif, cached_tif)
+    shutil.copy2(source_tfw, cached_tfw)
+    cache_winner_manifest(source_name, tile)
+
+
+def cache_winner_manifest(source_name, tile):
+    base_name = f"tile_{tile.z}_{tile.x}_{tile.y}"
+    manifest_path = os.path.join(WINNER_CACHE_DIR, base_name + ".json")
+    with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+        json.dump({"source": source_name, "z": tile.z, "x": tile.x, "y": tile.y}, manifest_file)
+
+
+def cache_skipped_tile(tile):
+    base_name = f"tile_{tile.z}_{tile.x}_{tile.y}"
+    manifest_path = os.path.join(WINNER_CACHE_DIR, base_name + ".json")
+    with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+        json.dump({"status": "skipped", "z": tile.z, "x": tile.x, "y": tile.y}, manifest_file)
+
+
+def format_eta(seconds):
+    if seconds is None:
+        return "calculating..."
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h {minutes:02d}m {seconds:02d}s"
+    if minutes:
+        return f"{minutes:d}m {seconds:02d}s"
+    return f"{seconds:d}s"
+
+
 # ==============================================================================
 # 4. MACOS APPLESCRIPT AUTOMATION FOR INSIGHT MAP CREATOR IN WINE
 # ==============================================================================
@@ -489,22 +596,146 @@ def to_wine_z_path(mac_path):
     win_slashes = mac_path.replace("/", "\\")
     return f"Z:{win_slashes}"
 
+def to_z_path(mac_path):
+    return f"Z:{mac_path}/"
+
+def make_atlas_description(chosen_name, input_path):
+    route_name = re.sub(r"^\[(?:Route|Track)\]\s*", "", chosen_name).strip()
+    route_name = re.sub(r"\s*\(Seg\s+\d+\)\s*$", "", route_name).strip()
+
+    if not route_name or route_name == "All_Routes":
+        input_name = os.path.splitext(os.path.basename(input_path))[0]
+        route_name = f"All Routes - {input_name or 'Route'}"
+
+    route_name = re.sub(r"[^A-Za-z0-9 _().+-]+", "_", route_name).strip(" _")
+    if not route_name:
+        route_name = DEFAULT_ATLAS_NAME
+
+    unique_key = f"{os.path.abspath(input_path)}:{chosen_name}"
+    unique_suffix = hashlib.sha256(unique_key.encode("utf-8")).hexdigest()[:6].upper()
+    return f"M={route_name}_{unique_suffix}"
+
+
+def escape_applescript_string(value):
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def check_keystroke_permission():
+    probe = 'tell application "System Events" to keystroke ""'
+    result = subprocess.run(
+        ["/usr/bin/osascript", "-e", probe],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return True
+
+    print("AppleScript keystroke permission is blocked.")
+    print("  1. Open System Settings -> Privacy & Security -> Accessibility.")
+    print("  2. Enable the app hosting the terminal: Terminal or Visual Studio Code.")
+    print("  3. Also add /usr/bin/osascript if macOS lists it separately.")
+    print("  4. Open Privacy & Security -> Automation -> System Events.")
+    print("  5. Enable the app hosting the terminal.")
+    print("  6. Fully quit and reopen Terminal or Visual Studio Code.")
+    print("  7. Run this script again and approve any macOS prompt.")
+    if result.stderr.strip():
+        print(f"  macOS response: {result.stderr.strip()}")
+    return False
+
+
+def sync_shared_imc_folder(mac_input_dir):
+    os.makedirs(SHARED_IMC_DIR, exist_ok=True)
+
+    for filename in os.listdir(SHARED_IMC_DIR):
+        if filename.lower().endswith((".tif", ".tfw")):
+            os.remove(os.path.join(SHARED_IMC_DIR, filename))
+
+    copied = 0
+    for filename in os.listdir(mac_input_dir):
+        if filename.lower().endswith((".tif", ".tfw")):
+            shutil.copy2(
+                os.path.join(mac_input_dir, filename),
+                os.path.join(SHARED_IMC_DIR, filename),
+            )
+            copied += 1
+
+    os.chmod(SHARED_IMC_DIR, 0o755)
+    print(f"Shared IMC folder: {SHARED_IMC_DIR} ({copied} files)")
+
 
 def automate_imc_in_wine(imc_exe_path, mac_input_dir, atlas_name):
     if not os.path.exists(imc_exe_path):
         print(f"IMC not found at: {imc_exe_path}")
         return
 
-    wine_input_path = to_wine_z_path(mac_input_dir)
+    if not check_keystroke_permission():
+        print("IMC was not launched because macOS denied keystroke access.")
+        return
+
+    sync_shared_imc_folder(mac_input_dir)
+    wine_input_path = to_wine_z_path(SHARED_IMC_DIR)
+    if imc_exe_path.lower().endswith(".app"):
+        wineskin_prefix = os.path.join(
+            imc_exe_path,
+            "Contents",
+            "SharedSupport",
+            "prefix",
+            "drive_c",
+        )
+        wineskin_root = os.path.dirname(wineskin_prefix)
+        dosdevices_dir = os.path.join(wineskin_root, "dosdevices")
+        shared_drive = os.path.join(dosdevices_dir, "m:")
+        os.makedirs(dosdevices_dir, exist_ok=True)
+        if os.path.lexists(shared_drive):
+            if os.path.islink(shared_drive) or os.path.isfile(shared_drive):
+                os.unlink(shared_drive)
+            else:
+                raise IsADirectoryError(f"Cannot replace Wine drive mapping: {shared_drive}")
+        os.symlink(SHARED_IMC_DIR, shared_drive)
+
+        prefix_input_dir = os.path.join(wineskin_prefix, "imc_input_geotiffs")
+        os.makedirs(prefix_input_dir, exist_ok=True)
+
+        for filename in os.listdir(prefix_input_dir):
+            if filename.lower().endswith((".tif", ".tfw")):
+                os.remove(os.path.join(prefix_input_dir, filename))
+        for filename in os.listdir(SHARED_IMC_DIR):
+            if filename.lower().endswith((".tif", ".tfw")):
+                shutil.copy2(
+                    os.path.join(SHARED_IMC_DIR, filename),
+                    os.path.join(prefix_input_dir, filename),
+                )
+
+        wine_input_path = "M:\\"
+
     print(f"Launching IMC in Wine with input path: {wine_input_path}")
-    subprocess.Popen(["wine", imc_exe_path])
+    if imc_exe_path.lower().endswith(".app"):
+        subprocess.Popen(["open", "-n", "-a", imc_exe_path])
+    else:
+        subprocess.Popen(["wine", imc_exe_path])
 
     time.sleep(6)
 
+    atlas_name = escape_applescript_string(atlas_name)
+    wine_input_path = escape_applescript_string(wine_input_path)
+    os.makedirs(AT5_OUTPUT_DIR, exist_ok=True)
+    save_work_directory = escape_applescript_string(
+        to_z_path(AT5_OUTPUT_DIR)
+    )
     applescript = f"""
     tell application "System Events"
-        set frontmost of (first process whose name contains "wine") to true
         delay 1.0
+        repeat with p in (every process whose background only is false)
+            try
+                repeat with w in (every window of p)
+                    if name of w contains "Insight Map Creator" then
+                        set frontmost of p to true
+                        perform action "AXRaise" of w
+                        exit repeat
+                    end if
+                end repeat
+            end try
+        end repeat
 
         -- Switch to Raster Mode: Alt+V (View) -> P (Processing Modes) -> R (Raster Mode)
         key down option
@@ -516,68 +747,189 @@ def automate_imc_in_wine(imc_exe_path, mac_input_dir, atlas_name):
         keystroke "r"
         delay 0.8
 
-        -- Open Advanced Options: Alt+A (Advanced Options) -> A (Atlas Options)
+        -- Set Atlas Description to M=[Route] and keep Atlas Version 12.
         key down option
-        keystroke "a"
+        keystroke "o"
         key up option
         delay 0.4
-        keystroke "a"
-        delay 0.6
-
-        -- Set Atlas Description and Atlas Version 12
+        key code 124
+        delay 0.4
+        keystroke tab
+        keystroke tab
+        keystroke return
+        delay 0.4
         keystroke "{atlas_name}"
         delay 0.2
+        key code 53
+        delay 0.6
+
+        -- Add C:/imc_input_geotiffs/ as the source folder.
+        keystroke tab
+        keystroke tab
         keystroke tab
         delay 0.2
-        keystroke "12"
-        delay 0.2
-        keystroke return
-        delay 0.6
-
-        -- Open Raster Options to enable Shaded Relief for Vulcan 7R overlay
-        key down option
-        keystroke "a"
-        key up option
-        delay 0.4
-        keystroke "r"
-        delay 0.6
         keystroke space
-        delay 0.2
-        keystroke return
-        delay 0.6
-
-        -- Trigger Add Folder button (Alt+F)
-        key down option
-        keystroke "f"
-        key up option
         delay 0.8
-
-        -- Paste Wine Z: path into folder selection box and confirm
-        keystroke "{wine_input_path}"
+        keystroke "C:/imc_input_geotiffs/"
         delay 0.4
-        keystroke return
+        key down option
+        keystroke "c"
+        key up option
         delay 0.8
 
-        -- Trigger Build (Alt+B)
-        key down option
-        keystroke "b"
-        key up option
+        -- Set resolution minimum and maximum.
+        keystroke tab
+        keystroke tab
+        keystroke tab
+        keystroke "0"
+        delay 0.4
+        keystroke tab
+        delay 0.4
+        keystroke "4"
+        delay 0.4
+        keystroke "4"
+        delay 0.4
+
+        -- Select Downloads as the work directory.
+        keystroke tab
+        keystroke "{save_work_directory}"
+        delay 0.4
+
+        -- Trigger Build.
+        keystroke tab
+        keystroke tab
+        keystroke space
     end tell
     """
 
     try:
-        subprocess.run(["osascript", "-e", applescript], check=True)
+        subprocess.run(["/usr/bin/osascript", "-e", applescript], check=True)
         print("Automated IMC configuration and Build trigger sent.")
     except subprocess.CalledProcessError as e:
         print(f"AppleScript automation encountered an issue: {e}")
-        print(
-            "Check that Terminal has Accessibility permissions in macOS System Settings."
-        )
+        print("Enable keystroke control for osascript in System Settings:")
+        print("  Privacy & Security -> Accessibility")
+        print("  Add/enable Terminal or Visual Studio Code")
+        print("  Privacy & Security -> Automation -> System Events")
+        print("Then fully quit and reopen the terminal app.")
 
 
 # ==============================================================================
 # MAIN EXECUTION
 # ==============================================================================
+def build_route_corridor(route_line):
+    to_meters = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transform
+    to_wgs84 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True).transform
+    segment_length_m = 3704.0
+    buffered_segments = []
+    line_m = transform(to_meters, route_line)
+    num_segments = max(1, int(math.ceil(line_m.length / segment_length_m)))
+
+    for i in range(num_segments):
+        start_dist = i * segment_length_m
+        end_dist = min((i + 1) * segment_length_m, line_m.length)
+        sub_line_m = LineString([
+            line_m.interpolate(d)
+            for d in np.linspace(start_dist, end_dist, num=5)
+        ])
+        mid_wgs = transform(to_wgs84, sub_line_m.interpolate(0.5, normalized=True))
+        probe_tile = mercantile.tile(mid_wgs.x, mid_wgs.y, 10)
+        probe_img = fetch_tile_image(
+            TILE_SOURCES["Esri_World_Imagery"],
+            probe_tile.x,
+            probe_tile.y,
+            10,
+            "Esri_World_Imagery",
+        )
+        near_coast = has_land_or_obstacle(probe_img)
+        radius_nm = COASTAL_BUFFER_NM if near_coast else OPEN_WATER_BUFFER_NM
+        buffered_segments.append(sub_line_m.buffer(radius_nm * 1852.0))
+
+    return transform(to_wgs84, unary_union(buffered_segments))
+
+
+def process_route_atlas(corridor_poly, chosen_name, input_path):
+    dynamic_atlas_name = make_atlas_description(chosen_name, input_path)
+    print(f"\nIMC Atlas Description: {dynamic_atlas_name}")
+    print(f"IMC target zoom levels: {', '.join(map(str, ATLAS_ZOOM_LEVELS))}")
+
+    for f in os.listdir(OUTPUT_DIR):
+        if f.endswith((".tif", ".tfw")):
+            os.remove(os.path.join(OUTPUT_DIR, f))
+
+    minx, miny, maxx, maxy = corridor_poly.bounds
+    candidate_tiles = list(
+        mercantile.tiles(minx, miny, maxx, maxy, zooms=[TARGET_ZOOM])
+    )
+    intersecting_tiles = [
+        t for t in candidate_tiles
+        if corridor_poly.intersects(box(*mercantile.bounds(t)))
+    ]
+    print(f"Scanning {len(intersecting_tiles)} candidate tiles in corridor...")
+
+    kept_count = 0
+    skipped_water = 0
+    cached_winner_count = 0
+    source_counts = {source_name: 0 for source_name in TILE_SOURCES}
+    uncached_tile_times = deque(maxlen=20)
+
+    for processed_count, t in enumerate(intersecting_tiles, start=1):
+        remaining_count = len(intersecting_tiles) - processed_count
+        remaining_percent = (
+            (remaining_count / len(intersecting_tiles) * 100.0)
+            if intersecting_tiles else 0.0
+        )
+
+        cached_source_name = restore_cached_tile(t, OUTPUT_DIR)
+        if cached_source_name == "__skipped__":
+            skipped_water += 1
+        elif cached_source_name is not None:
+            kept_count += 1
+            cached_winner_count += 1
+            source_counts[cached_source_name] += 1
+        else:
+            uncached_start = time.monotonic()
+            winner_source_name, winner_img, _ = select_best_source_for_tile(t)
+            if winner_source_name is None:
+                skipped_water += 1
+                cache_skipped_tile(t)
+            else:
+                save_geotiff_for_imc(winner_img, t, OUTPUT_DIR)
+                cache_winner(winner_source_name, t)
+                kept_count += 1
+                source_counts[winner_source_name] += 1
+            uncached_tile_times.append(time.monotonic() - uncached_start)
+            time.sleep(0.05)
+
+        average_tile_seconds = (
+            sum(uncached_tile_times) / len(uncached_tile_times)
+            if uncached_tile_times else None
+        )
+        eta_text = format_eta(
+            average_tile_seconds * remaining_count
+            if average_tile_seconds is not None else None
+        )
+        print(
+            f"\r  Processed {processed_count}/{len(intersecting_tiles)} files "
+            f"({remaining_percent:.1f}% remaining) - ETA: {eta_text}",
+            end="",
+            flush=True,
+        )
+
+    print("\n\nTile Processing Summary:")
+    print(f"  - Kept {kept_count} land/reef GeoTIFF tiles in: {OUTPUT_DIR}")
+    print(f"  - Restored {cached_winner_count} winner tiles from cache.")
+    print(f"  - Skipped {skipped_water} open-water tiles.")
+    print("  - Winning source per tile:")
+    for source_name, count in source_counts.items():
+        print(f"      {source_name}: {count}")
+
+    if kept_count > 0:
+        automate_imc_in_wine(WINE_IMC_PATH, OUTPUT_DIR, dynamic_atlas_name)
+    else:
+        print("No land or reef tiles detected along this route; skipping IMC build.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Build B&G Vulcan 7R satellite imagery overlays from a .usr or .gpx route file."
@@ -595,50 +947,15 @@ def main():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    for f in os.listdir(OUTPUT_DIR):
-        if f.endswith((".tif", ".tfw")):
-            os.remove(os.path.join(OUTPUT_DIR, f))
+    os.makedirs(TILE_CACHE_DIR, exist_ok=True)
+    os.makedirs(WINNER_CACHE_DIR, exist_ok=True)
 
-    corridor_poly, route_coords, dynamic_atlas_name = build_adaptive_corridor(input_path)
-    best_source_name = select_best_source(route_coords, TARGET_ZOOM)
-    source_url = TILE_SOURCES[best_source_name]
+    _, _, chosen_name, route_choices = build_adaptive_corridor(input_path)
 
-    minx, miny, maxx, maxy = corridor_poly.bounds
-    candidate_tiles = list(
-        mercantile.tiles(minx, miny, maxx, maxy, zooms=[TARGET_ZOOM])
-    )
-    print(f"Scanning {len(candidate_tiles)} candidate tiles in corridor...")
-
-    kept_count = 0
-    skipped_water = 0
-
-    for t in candidate_tiles:
-        tile_poly = box(*mercantile.bounds(t))
-        if not corridor_poly.intersects(tile_poly):
-            continue
-
-        img = fetch_tile_image(source_url, t.x, t.y, t.z)
-        if img is None:
-            continue
-
-        if not has_land_or_obstacle(img):
-            skipped_water += 1
-            continue
-
-        save_geotiff_for_imc(img, t, OUTPUT_DIR)
-        kept_count += 1
-        time.sleep(0.05)
-
-    print("\nTile Processing Summary:")
-    print(f"  - Kept {kept_count} land/reef GeoTIFF tiles in: {OUTPUT_DIR}")
-    print(f"  - Skipped {skipped_water} open-water tiles.")
-
-    if kept_count > 0:
-        automate_imc_in_wine(WINE_IMC_PATH, OUTPUT_DIR, dynamic_atlas_name)
-    else:
-        print(
-            "No land or reef tiles detected along this route; skipping IMC build."
-        )
+    for index, (route_label, route_line, _) in enumerate(route_choices, start=1):
+        print(f"\n=== Processing route {index}/{len(route_choices)}: {route_label} ===")
+        corridor_poly = build_route_corridor(route_line)
+        process_route_atlas(corridor_poly, route_label, input_path)
 
 
 if __name__ == "__main__":
