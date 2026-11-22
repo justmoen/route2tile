@@ -47,6 +47,8 @@ TILE_SOURCES = {
     ),
     "Google_Satellite": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
     "Bing_VirtualEarth": "https://ecn.t3.tiles.virtualearth.net/tiles/a{q}.jpeg?g=1",
+    "Allen Coral Atlas": "https://tiles.allencoralatlas.org/tiles/{z}/{x}/{y}.jpg",
+    "Sentinel-2 Cloudless": "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2019_3857/default/g/{z}/{y}/{x}.jpg",
 }
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
@@ -117,21 +119,40 @@ def has_land_or_obstacle(img):
 
     return False
 
-
 def score_source_quality(img):
-    """Scores sharpness while penalizing clouds, glare, and low-res upscales."""
-    if img is None:
-        return -1.0
+  """Scores coastal/underwater clarity while penalizing fog, glare, and turbid runoff."""
+  if img is None:
+    return -1.0
 
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    cloud_mask = (hsv[:, :, 1] < 30) & (hsv[:, :, 2] > 220)
-    cloud_ratio = np.mean(cloud_mask)
-    if cloud_ratio > 0.25:
-        return 0.0
+  hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+  h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
-    return sharpness * (1.0 - cloud_ratio)
+  # 1. Dense cloud / bright sun glare mask
+  cloud_mask = (s < 35) & (v > 215)
+  cloud_ratio = np.mean(cloud_mask)
+  if cloud_ratio > 0.20:
+    return 0.0
+
+  # 2. Thin fog / coastal haze mask (low saturation, medium-high brightness)
+  haze_mask = (s < 45) & (v > 145) & (v <= 215)
+  haze_ratio = np.mean(haze_mask)
+  if haze_ratio > 0.35:
+    return 0.0
+
+  # 3. Dark channel prior (standard dehazing metric: foggy pixels have high min(B,G,R))
+  min_channel = np.min(img, axis=2)
+  haze_intensity = np.mean(min_channel) / 255.0  # Higher = hazier/milkier
+
+  # 4. Sharpness & tonal contrast (fog crushes standard deviation)
+  gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+  sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+  contrast = np.std(gray) / 128.0  # Normalized contrast; foggy tiles have low std
+
+  # Penalize haze heavily using exponential decay on dark-channel brightness
+  haze_penalty = np.exp(-3.5 * haze_intensity)
+  clean_ratio = max(0.0, 1.0 - (cloud_ratio * 2.0 + haze_ratio * 1.2))
+
+  return sharpness * contrast * haze_penalty * clean_ratio
 
 
 # ==============================================================================
